@@ -5,7 +5,7 @@ import sys
 import time
 import warnings
 from random import sample
-import datetime  # 新增：用于生成时间戳文件夹名
+import datetime
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -25,7 +25,53 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
-parser = argparse.ArgumentParser(description='Crystal Graph Convolutional Neural Networks')
+
+# ==================== 自适应加权损失函数类 ====================
+class AdaptiveWeightedLoss(nn.Module):
+    """自适应加权损失函数，基于图复杂度计算样本权重"""
+
+    def __init__(self, base_loss_fn=None, weight_range=(0.8, 1.5)):
+        super(AdaptiveWeightedLoss, self).__init__()
+        self.base_loss_fn = base_loss_fn or nn.SmoothL1Loss(reduction='none')
+        self.weight_range = weight_range
+        self.last_weights_mean = 0.0
+        self.last_complexity_mean = 0.0
+        self.last_fusion_weights = None
+
+    def forward(self, predictions, targets, complexities=None, adaptive_weights=None):
+        if hasattr(self.base_loss_fn, 'reduction'):
+            original_reduction = getattr(self.base_loss_fn, 'reduction', 'mean')
+            self.base_loss_fn.reduction = 'none'
+            base_loss = self.base_loss_fn(predictions, targets)
+            self.base_loss_fn.reduction = original_reduction
+        else:
+            base_loss = self.base_loss_fn(predictions, targets)
+
+        if adaptive_weights is not None and len(adaptive_weights) == len(base_loss):
+            weights = adaptive_weights
+            self.last_weights_mean = weights.mean().item()
+            self.last_complexity_mean = complexities.mean().item() if complexities is not None else 0.0
+        elif complexities is not None and len(complexities) == len(base_loss):
+            weight_min, weight_max = self.weight_range
+            weights = weight_min + (weight_max - weight_min) * complexities
+            self.last_weights_mean = weights.mean().item()
+            self.last_complexity_mean = complexities.mean().item()
+        else:
+            loss = base_loss.mean() if base_loss.dim() > 0 else base_loss
+            return loss
+
+        if weights.dim() == 1 and base_loss.dim() > 1:
+            weights = weights.unsqueeze(1)
+
+        loss = (base_loss * weights).mean()
+        return loss
+
+
+# ==================== 自适应加权损失函数结束 ====================
+
+
+parser = argparse.ArgumentParser(
+    description='Crystal Graph Convolutional Neural Networks with MC Dropout and Adaptive Weighted Loss')
 parser.add_argument('data_options', metavar='OPTIONS', nargs='+',
                     help='dataset options, started with the path to root dir, '
                          'then other options')
@@ -47,11 +93,9 @@ parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
 parser.add_argument('-b', '--batch-size', default=256, type=int,
                     metavar='N', help='mini-batch size (default: 256)')
 parser.add_argument('--lr', '--learning-rate', default=0.01, type=float,
-                    metavar='LR', help='initial learning rate (default: '
-                                       '0.01)')
+                    metavar='LR', help='initial learning rate (default: 0.01)')
 parser.add_argument('--lr-milestones', default=[100], nargs='+', type=int,
-                    metavar='N', help='milestones for scheduler (default: '
-                                      '[100])')
+                    metavar='N', help='milestones for scheduler (default: [100])')
 parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
                     help='momentum')
 parser.add_argument('--weight-decay', '--wd', default=0, type=float,
@@ -60,6 +104,33 @@ parser.add_argument('--print-freq', '-p', default=10, type=int,
                     metavar='N', help='print frequency (default: 10)')
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
+
+# ==================== 加权损失相关命令行参数 ====================
+parser.add_argument('--use-weighted-loss', action='store_true',
+                    help='Use weighted loss based on graph complexity')
+parser.add_argument('--use-adaptive-weights', action='store_true',
+                    help='Use adaptive weights (learnable fusion parameters)')
+parser.add_argument('--weight-min', default=0.8, type=float,
+                    help='Minimum weight for weighted loss (default: 0.8)')
+parser.add_argument('--weight-max', default=1.5, type=float,
+                    help='Maximum weight for weighted loss (default: 1.5)')
+# ==================== 加权损失相关参数结束 ====================
+
+
+# ==================== MC Dropout相关参数 ====================
+parser.add_argument('--mc-dropout-samples', default=50, type=int,
+                    help='Number of MC Dropout forward passes for uncertainty estimation (default: 50)')
+parser.add_argument('--confidence-interval', default=95, type=float,
+                    help='Confidence interval percentage (default: 95)')
+# ==================== MC Dropout相关参数结束 ====================
+
+
+# ==================== 输出目录参数 ====================
+parser.add_argument('--output-dir', default='D:\\modle-new\\modle-new\\CA-CGCNN\\时间戳文件', type=str, metavar='PATH',
+                    help='Custom output directory for timestamp folders (default: D:\\modle-new\\modle-new\\CA-CGCNN\\时间戳文件)')
+# ==================== 输出目录参数结束 ====================
+
+
 train_group = parser.add_mutually_exclusive_group()
 train_group.add_argument('--train-ratio', default=None, type=float, metavar='N',
                          help='number of training data to be loaded (default none)')
@@ -67,11 +138,9 @@ train_group.add_argument('--train-size', default=None, type=int, metavar='N',
                          help='number of training data to be loaded (default none)')
 valid_group = parser.add_mutually_exclusive_group()
 valid_group.add_argument('--val-ratio', default=0.1, type=float, metavar='N',
-                         help='percentage of validation data to be loaded (default '
-                              '0.1)')
+                         help='percentage of validation data to be loaded (default 0.1)')
 valid_group.add_argument('--val-size', default=None, type=int, metavar='N',
-                         help='number of validation data to be loaded (default '
-                              '1000)')
+                         help='number of validation data to be loaded (default 1000)')
 test_group = parser.add_mutually_exclusive_group()
 test_group.add_argument('--test-ratio', default=0.1, type=float, metavar='N',
                         help='percentage of test data to be loaded (default 0.1)')
@@ -89,55 +158,67 @@ parser.add_argument('--n-conv', default=3, type=int, metavar='N',
                     help='number of conv layers')
 parser.add_argument('--n-h', default=1, type=int, metavar='N',
                     help='number of hidden layers after pooling')
-# 新增参数：手动输入内容
 parser.add_argument('--manual-notes', type=str, default='',
                     help='Additional manual notes to save in parameters file')
 
 
-def get_predictions(data_loader, model, normalizer):
-    """获取数据集的预测结果"""
-    model.eval()
-    targets = []
-    preds = []
-    cif_ids = []
+def get_predictions_with_uncertainty(data_loader, model, normalizer, mc_samples=50, confidence=95):
+    """获取数据集的预测结果及不确定性估计，使用MC Dropout进行多次前向传播"""
+    model.train()
+    all_targets = []
+    all_preds_mean = []
+    all_preds_std = []
+    all_cif_ids = []
 
-    for i, (input, target, batch_cif_ids) in enumerate(data_loader):
-        # 拆分结构特征和额外特征
-        struct_input = input[:4]  # 前4项为结构特征
-        extra_fea = input[4]  # 第5项为额外特征
+    from scipy import stats
+    z_score = stats.norm.ppf((1 + confidence / 100) / 2)
 
-        if args.cuda:
-            with torch.no_grad():
-                input_var = (Variable(struct_input[0].cuda(non_blocking=True)),
-                             Variable(struct_input[1].cuda(non_blocking=True)),
-                             struct_input[2].cuda(non_blocking=True),
-                             [crys_idx.cuda(non_blocking=True) for crys_idx in struct_input[3]],
-                             Variable(extra_fea.cuda(non_blocking=True))  # 添加额外特征
-                             )
-        else:
-            with torch.no_grad():
-                input_var = (Variable(struct_input[0]),
-                             Variable(struct_input[1]),
-                             struct_input[2],
-                             struct_input[3],
-                             Variable(extra_fea)  # 添加额外特征
-                             )
+    for i, (input, target, batch_cif_ids) in enumerate(tqdm(data_loader, desc='MC Dropout Inference')):
+        struct_input = input[:4]
+        extra_fea = input[4]
 
-        # compute output
-        output = model(*input_var)
+        batch_size = target.size(0)
+        mc_predictions = []
 
-        if args.task == 'regression':
-            pred = normalizer.denorm(output.data.cpu())
-            target_val = target
-        else:
-            pred = torch.exp(output.data.cpu())
-            target_val = target.view(-1).long()
+        for _ in range(mc_samples):
+            if args.cuda:
+                with torch.no_grad():
+                    input_var = (Variable(struct_input[0].cuda(non_blocking=True)),
+                                 Variable(struct_input[1].cuda(non_blocking=True)),
+                                 struct_input[2].cuda(non_blocking=True),
+                                 [crys_idx.cuda(non_blocking=True) for crys_idx in struct_input[3]],
+                                 Variable(extra_fea.cuda(non_blocking=True)))
+            else:
+                with torch.no_grad():
+                    input_var = (Variable(struct_input[0]),
+                                 Variable(struct_input[1]),
+                                 struct_input[2],
+                                 struct_input[3],
+                                 Variable(extra_fea))
 
-        preds += pred.view(-1).tolist()
-        targets += target_val.view(-1).tolist()
-        cif_ids += batch_cif_ids
+            output = model(*input_var, return_complexity=False)
 
-    return targets, preds, cif_ids
+            if args.task == 'regression':
+                pred = normalizer.denorm(output.data.cpu())
+            else:
+                pred = torch.exp(output.data.cpu())
+
+            mc_predictions.append(pred.view(-1).numpy())
+
+        mc_predictions = np.array(mc_predictions)
+        pred_mean = np.mean(mc_predictions, axis=0)
+        pred_std = np.std(mc_predictions, axis=0)
+        pred_ci = z_score * pred_std
+
+        all_preds_mean.extend(pred_mean.tolist())
+        all_preds_std.extend(pred_std.tolist())
+        all_targets.extend(target.view(-1).tolist())
+        all_cif_ids.extend(batch_cif_ids)
+
+        if i % 10 == 0:
+            print(f'  Batch {i}: Mean uncertainty = {np.mean(pred_std):.4f} eV')
+
+    return all_targets, all_preds_mean, all_preds_std, all_cif_ids
 
 
 def save_parameters_to_file(manual_notes=""):
@@ -154,7 +235,6 @@ def save_parameters_to_file(manual_notes=""):
         f.write("MODEL PARAMETERS\n")
         f.write("=" * 50 + "\n")
 
-        # 模型参数
         f.write(f"Task: {args.task}\n")
         f.write(f"Atom feature length: {args.atom_fea_len}\n")
         f.write(f"Hidden feature length: {args.h_fea_len}\n")
@@ -163,10 +243,26 @@ def save_parameters_to_file(manual_notes=""):
         f.write(f"Dropout probability: {args.dropout}\n")
 
         f.write("\n" + "=" * 50 + "\n")
+        f.write("MC DROPOUT UNCERTAINTY PARAMETERS\n")
+        f.write("=" * 50 + "\n")
+        f.write(f"MC Dropout samples: {args.mc_dropout_samples}\n")
+        f.write(f"Confidence interval: {args.confidence_interval}%\n")
+
+        f.write("\n" + "=" * 50 + "\n")
+        f.write("WEIGHTED LOSS PARAMETERS\n")
+        f.write("=" * 50 + "\n")
+        f.write(f"Use weighted loss: {args.use_weighted_loss}\n")
+        if args.use_weighted_loss:
+            f.write(f"Use adaptive weights: {args.use_adaptive_weights}\n")
+            if args.use_adaptive_weights:
+                f.write("Using learnable adaptive weight fusion\n")
+            else:
+                f.write(f"Weight range: [{args.weight_min}, {args.weight_max}]\n")
+
+        f.write("\n" + "=" * 50 + "\n")
         f.write("TRAINING PARAMETERS\n")
         f.write("=" * 50 + "\n")
 
-        # 训练参数
         f.write(f"Epochs: {args.epochs}\n")
         f.write(f"Batch size: {args.batch_size}\n")
         f.write(f"Learning rate: {args.lr}\n")
@@ -179,7 +275,6 @@ def save_parameters_to_file(manual_notes=""):
         f.write("DATA PARAMETERS\n")
         f.write("=" * 50 + "\n")
 
-        # 数据参数
         f.write(f"Data path: {args.data_options[0]}\n")
         f.write(f"Feature file: {args.feature_file}\n")
         f.write(f"Train ratio: {args.train_ratio}\n")
@@ -191,12 +286,10 @@ def save_parameters_to_file(manual_notes=""):
         f.write("HARDWARE SETTINGS\n")
         f.write("=" * 50 + "\n")
 
-        # 硬件设置
         f.write(f"CUDA enabled: {args.cuda}\n")
         if args.cuda:
             f.write(f"GPU: {torch.cuda.get_device_name(0)}\n")
 
-        # 手动输入的备注
         if manual_notes:
             f.write("\n" + "=" * 50 + "\n")
             f.write("MANUAL NOTES\n")
@@ -230,7 +323,6 @@ def get_manual_input():
         except EOFError:
             break
 
-    # 移除最后的空行
     if lines and lines[-1] == "":
         lines = lines[:-1]
 
@@ -238,12 +330,7 @@ def get_manual_input():
 
 
 def plot_mae_curve(train_maes, val_maes):
-    """
-    绘制训练集和验证集的MAE曲线
-    train_maes: 每个epoch的训练集MAE列表
-    val_maes: 每个epoch的验证集MAE列表
-    """
-    # 保存MAE曲线原始数据到CSV
+    """绘制训练集和验证集的MAE曲线"""
     mae_data = pd.DataFrame({
         'epoch': range(1, len(train_maes) + 1),
         'train_mae': train_maes,
@@ -252,7 +339,6 @@ def plot_mae_curve(train_maes, val_maes):
     mae_data.to_csv(os.path.join(subdirs["train_data"], 'mae_curve_data.csv'), index=False)
     print("MAE curve data saved")
 
-    # 绘制MAE曲线
     plt.figure(figsize=(10, 6))
     plt.plot(train_maes, label='Training MAE', color='red', linestyle='-', linewidth=2)
     plt.plot(val_maes, label='Validation MAE', color='blue', linestyle='--', linewidth=2)
@@ -267,12 +353,125 @@ def plot_mae_curve(train_maes, val_maes):
     print("MAE curve saved")
 
 
+def plot_predictions_with_uncertainty(targets, predictions, uncertainties, cif_ids, dataset_name):
+    """绘制带有不确定性估计的预测散点图"""
+    targets = np.array(targets)
+    predictions = np.array(predictions)
+    uncertainties = np.array(uncertainties)
+
+    z_score = 1.96
+    ci_half = z_score * uncertainties
+
+    mean_uncertainty = np.mean(uncertainties)
+    median_uncertainty = np.median(uncertainties)
+    p90_uncertainty = np.percentile(uncertainties, 90)
+
+    print(f"\n{dataset_name} Set Uncertainty Statistics:")
+    print(f"  Mean uncertainty: {mean_uncertainty:.4f} eV")
+    print(f"  Median uncertainty: {median_uncertainty:.4f} eV")
+    print(f"  90th percentile uncertainty: {p90_uncertainty:.4f} eV")
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+
+    ax1 = axes[0, 0]
+    n_show = min(100, len(targets))
+    indices = np.random.choice(len(targets), n_show, replace=False)
+
+    ax1.errorbar(targets[indices], predictions[indices],
+                 yerr=ci_half[indices], fmt='o', alpha=0.6,
+                 capsize=3, elinewidth=1, markersize=4)
+
+    min_val = min(min(targets), min(predictions)) - 0.1
+    max_val = max(max(targets), max(predictions)) + 0.1
+    ax1.plot([min_val, max_val], [min_val, max_val], 'k--', lw=2, label='Ideal Prediction')
+
+    ax1.set_xlabel('Calculated Band Gap (eV)', fontsize=12)
+    ax1.set_ylabel('Predicted Band Gap (eV)', fontsize=12)
+    ax1.set_title(f'{dataset_name} Set: Predictions with 95% CI', fontsize=14)
+    ax1.grid(True, alpha=0.3)
+    ax1.legend()
+    # 在图下方添加标签
+    ax1.text(0.5, -0.15, '(a) Scatter plot with confidence intervals',
+             transform=ax1.transAxes, fontsize=12, ha='center')
+
+    ax2 = axes[0, 1]
+    scatter = ax2.scatter(targets, predictions, c=uncertainties,
+                          cmap='viridis', alpha=0.7, s=20)
+    ax2.plot([min_val, max_val], [min_val, max_val], 'k--', lw=2)
+    ax2.set_xlabel('Calculated Band Gap (eV)', fontsize=12)
+    ax2.set_ylabel('Predicted Band Gap (eV)', fontsize=12)
+    ax2.set_title(f'{dataset_name} Set: Uncertainty Color Map', fontsize=14)
+    ax2.grid(True, alpha=0.3)
+    plt.colorbar(scatter, ax=ax2, label='Uncertainty (eV)')
+    # 在图下方添加标签
+    ax2.text(0.5, -0.15, '(b) Uncertainty color map',
+             transform=ax2.transAxes, fontsize=12, ha='center')
+
+    ax3 = axes[1, 0]
+    ax3.hist(uncertainties, bins=30, edgecolor='black', alpha=0.7)
+    ax3.axvline(mean_uncertainty, color='red', linestyle='--',
+                linewidth=2, label=f'Mean: {mean_uncertainty:.3f}')
+    ax3.axvline(median_uncertainty, color='blue', linestyle='--',
+                linewidth=2, label=f'Median: {median_uncertainty:.3f}')
+    ax3.axvline(p90_uncertainty, color='green', linestyle='--',
+                linewidth=2, label=f'90th: {p90_uncertainty:.3f}')
+    ax3.set_xlabel('Uncertainty (eV)', fontsize=12)
+    ax3.set_ylabel('Frequency', fontsize=12)
+    ax3.set_title(f'{dataset_name} Set: Uncertainty Distribution', fontsize=14)
+    ax3.legend()
+    ax3.grid(True, alpha=0.3)
+    # 在图下方添加标签
+    ax3.text(0.5, -0.15, '(c) Uncertainty distribution histogram',
+             transform=ax3.transAxes, fontsize=12, ha='center')
+
+    ax4 = axes[1, 1]
+    abs_errors = np.abs(targets - predictions)
+    ax4.scatter(uncertainties, abs_errors, alpha=0.6, s=15)
+
+    z = np.polyfit(uncertainties, abs_errors, 1)
+    p = np.poly1d(z)
+    x_trend = np.linspace(min(uncertainties), max(uncertainties), 100)
+    ax4.plot(x_trend, p(x_trend), 'r--', linewidth=2,
+             label=f'Trend (slope: {z[0]:.3f})')
+
+    ax4.set_xlabel('Uncertainty (eV)', fontsize=12)
+    ax4.set_ylabel('Absolute Error (eV)', fontsize=12)
+    ax4.set_title(f'{dataset_name} Set: Error vs Uncertainty', fontsize=14)
+    ax4.legend()
+    ax4.grid(True, alpha=0.3)
+    # 在图下方添加标签
+    ax4.text(0.5, -0.15, '(d) Error vs uncertainty relationship',
+             transform=ax4.transAxes, fontsize=12, ha='center')
+
+    # 调整子图布局，为底部标签留出空间
+    plt.tight_layout()
+    plt.subplots_adjust(bottom=0.1)  # 增加底部边距
+    plt.savefig(os.path.join(subdirs["figure"], f'{dataset_name.lower()}_uncertainty_analysis.png'), dpi=300)
+    plt.close()
+
+    uncertainty_df = pd.DataFrame({
+        'material_id': cif_ids,
+        'true_value': targets,
+        'predicted_value': predictions,
+        'uncertainty': uncertainties,
+        'ci_95_lower': predictions - ci_half,
+        'ci_95_upper': predictions + ci_half,
+        'absolute_error': abs_errors
+    })
+    uncertainty_df.to_csv(os.path.join(subdirs["csv"], f'{dataset_name.lower()}_uncertainty_data.csv'), index=False)
+
+    print(f"Uncertainty analysis plots and data saved for {dataset_name} set")
+
 def main():
     global best_mae_error, subdirs, main_output_dir
 
-    # 创建时间戳文件夹结构
     current_time = datetime.datetime.now().strftime("%Y%m%d%H%M")
-    main_output_dir = os.path.join(os.getcwd(), current_time)
+
+    # 使用指定的输出目录
+    # 确保基础目录存在
+    os.makedirs(args.output_dir, exist_ok=True)
+    main_output_dir = os.path.join(args.output_dir, current_time)
+
     subdirs = {
         "checkpoint": os.path.join(main_output_dir, "checkpoint"),
         "csv": os.path.join(main_output_dir, "csv"),
@@ -283,25 +482,31 @@ def main():
         os.makedirs(dir_path, exist_ok=True)
     print(f"所有输出文件将保存到: {main_output_dir}")
 
-    # 获取手动输入的额外内容
+    if args.use_weighted_loss:
+        print("=" * 60)
+        print("使用基于图复杂度的加权损失函数")
+        if args.use_adaptive_weights:
+            print("使用自适应权重（可学习融合参数）")
+        else:
+            print(f"使用固定权重范围: [{args.weight_min}, {args.weight_max}]")
+        print("=" * 60)
+
     manual_notes = ""
     if args.manual_notes:
         manual_notes = args.manual_notes
     else:
-        # 如果没有通过命令行参数提供，则交互式获取
         try:
             manual_notes = get_manual_input()
         except Exception as e:
             print(f"手动输入失败: {e}，将继续使用空备注")
 
-    # 保存参数到文件
-    params_file = save_parameters_to_file(manual_notes)
+    save_parameters_to_file(manual_notes)
 
     if args.task == 'regression':
         best_mae_error = 1e10
     else:
         best_mae_error = 0.
-    # load data
+
     dataset = CIFData(
         *args.data_options,
         feature_file=args.feature_file,
@@ -323,7 +528,6 @@ def main():
         test_size=args.test_size,
         return_test=True)
 
-    # obtain target value normalizer
     if args.task == 'classification':
         normalizer = Normalizer(torch.zeros(2))
         normalizer.load_state_dict({'mean': 0., 'std': 1.})
@@ -338,7 +542,6 @@ def main():
         _, sample_target, _ = collate_pool(sample_data_list)
         normalizer = Normalizer(sample_target)
 
-    # build model
     structures, _, _ = dataset[0]
     orig_atom_fea_len = structures[0].shape[-1]
     nbr_fea_len = structures[1].shape[-1]
@@ -359,11 +562,19 @@ def main():
 
     print("Model device:", next(model.parameters()).device)
 
-    # define loss func and optimizer
     if args.task == 'classification':
         criterion = nn.NLLLoss()
     else:
-        criterion = nn.SmoothL1Loss()
+        if args.use_weighted_loss:
+            print("使用加权损失函数")
+            base_criterion = nn.SmoothL1Loss()
+            criterion = AdaptiveWeightedLoss(
+                base_loss_fn=base_criterion,
+                weight_range=(args.weight_min, args.weight_max)
+            )
+        else:
+            criterion = nn.SmoothL1Loss()
+
     if args.optim == 'SGD':
         optimizer = torch.optim.SGD(model.parameters(), args.lr,
                                     momentum=args.momentum,
@@ -380,7 +591,6 @@ def main():
     else:
         raise NameError('Only SGD, Adam, AdamW, or LAMB is allowed as --optim')
 
-    # optionally resume from a checkpoint
     if args.resume:
         if os.path.isfile(args.resume):
             print("=> loading checkpoint '{}'".format(args.resume))
@@ -398,20 +608,16 @@ def main():
     scheduler = MultiStepLR(optimizer, milestones=args.lr_milestones,
                             gamma=0.1)
 
-    # 添加记录训练和验证损失值的列表
     train_losses = []
     val_losses = []
-    # 新增：记录训练和验证MAE的列表
     train_maes = []
     val_maes = []
 
     for epoch in range(args.start_epoch, args.epochs):
-        # train for one epoch
         train_loss, train_mae = train(train_loader, model, criterion, optimizer, epoch, normalizer)
         train_losses.append(train_loss)
         train_maes.append(train_mae)
 
-        # 验证一个 epoch
         val_mae, val_targets, val_preds, val_cif_ids = validate(val_loader, model, criterion, normalizer)
         print('Validation MAE: {:.3f}'.format(val_mae))
         val_losses.append(val_mae)
@@ -423,7 +629,6 @@ def main():
 
         scheduler.step()
 
-        # 保存最佳模型
         if args.task == 'regression':
             is_best = val_mae < best_mae_error
             best_mae_error = min(val_mae, best_mae_error)
@@ -439,33 +644,45 @@ def main():
             'args': vars(args)
         }, is_best)
 
-    # 绘制损失值变化曲线图
     plot_loss_curve(train_losses, val_losses)
-
-    # 绘制MAE曲线图
     plot_mae_curve(train_maes, val_maes)
 
-    print('---------Evaluate Model on Test Set---------------')
+    print('\n---------Evaluate Model with MC Dropout Uncertainty Estimation---------------')
     best_checkpoint = torch.load(os.path.join(subdirs["checkpoint"], 'model_best.pth.tar'))
     model.load_state_dict(best_checkpoint['state_dict'])
 
-    # 获取测试结果，包括cif_ids
-    test_mae, test_targets, test_preds, test_cif_ids = validate(val_loader, model, criterion, normalizer, test=True)
-    print('Test MAE: {:.3f}'.format(test_mae))
+    print('\n---------Getting Training Set Predictions with Uncertainty---------------')
+    train_targets, train_preds, train_uncertainties, train_cif_ids = get_predictions_with_uncertainty(
+        train_loader, model, normalizer,
+        mc_samples=args.mc_dropout_samples,
+        confidence=args.confidence_interval
+    )
 
-    # 获取训练集预测结果
-    print('---------Getting Training Set Predictions---------------')
-    train_targets, train_preds, train_cif_ids = get_predictions(train_loader, model, normalizer)
+    print('\n---------Getting Validation Set Predictions with Uncertainty---------------')
+    val_targets, val_preds, val_uncertainties, val_cif_ids = get_predictions_with_uncertainty(
+        val_loader, model, normalizer,
+        mc_samples=args.mc_dropout_samples,
+        confidence=args.confidence_interval
+    )
 
-    # 获取验证集预测结果（使用最佳模型）
-    print('---------Getting Validation Set Predictions---------------')
-    val_targets, val_preds, val_cif_ids = get_predictions(val_loader, model, normalizer)
+    print('\n---------Getting Test Set Predictions with Uncertainty---------------')
+    test_targets, test_preds, test_uncertainties, test_cif_ids = get_predictions_with_uncertainty(
+        test_loader, model, normalizer,
+        mc_samples=args.mc_dropout_samples,
+        confidence=args.confidence_interval
+    )
 
-    # 创建包含所有数据集的DataFrame
+    test_mae = np.mean(np.abs(np.array(test_targets) - np.array(test_preds)))
+    print(f'\nTest MAE: {test_mae:.4f} eV')
+    print(f'Test Mean Uncertainty: {np.mean(test_uncertainties):.4f} eV')
+
     train_df = pd.DataFrame({
         'material_id': train_cif_ids,
         'true_value': train_targets,
         'predicted_value': train_preds,
+        'uncertainty': train_uncertainties,
+        'ci_95_lower': np.array(train_preds) - 1.96 * np.array(train_uncertainties),
+        'ci_95_upper': np.array(train_preds) + 1.96 * np.array(train_uncertainties),
         'dataset': 'train'
     })
 
@@ -473,6 +690,9 @@ def main():
         'material_id': val_cif_ids,
         'true_value': val_targets,
         'predicted_value': val_preds,
+        'uncertainty': val_uncertainties,
+        'ci_95_lower': np.array(val_preds) - 1.96 * np.array(val_uncertainties),
+        'ci_95_upper': np.array(val_preds) + 1.96 * np.array(val_uncertainties),
         'dataset': 'validation'
     })
 
@@ -480,65 +700,54 @@ def main():
         'material_id': test_cif_ids,
         'true_value': test_targets,
         'predicted_value': test_preds,
+        'uncertainty': test_uncertainties,
+        'ci_95_lower': np.array(test_preds) - 1.96 * np.array(test_uncertainties),
+        'ci_95_upper': np.array(test_preds) + 1.96 * np.array(test_uncertainties),
         'dataset': 'test'
     })
 
-    # 合并所有数据集
     all_results_df = pd.concat([train_df, val_df, test_df], ignore_index=True)
+    all_results_df.to_csv(os.path.join(subdirs["csv"], 'all_predictions_with_uncertainty.csv'), index=False)
 
-    # 保存到CSV文件
-    all_results_df.to_csv(os.path.join(subdirs["csv"], 'all_predictions.csv'), index=False)
-    print("All predictions saved to 'all_predictions.csv'")
+    train_df.to_csv(os.path.join(subdirs["csv"], 'train_predictions_with_uncertainty.csv'), index=False)
+    val_df.to_csv(os.path.join(subdirs["csv"], 'validation_predictions_with_uncertainty.csv'), index=False)
+    test_df.to_csv(os.path.join(subdirs["csv"], 'test_predictions_with_uncertainty.csv'), index=False)
 
-    # 分别保存每个数据集
-    train_df.to_csv(os.path.join(subdirs["csv"], 'train_predictions.csv'), index=False)
-    val_df.to_csv(os.path.join(subdirs["csv"], 'validation_predictions.csv'), index=False)
-    test_df.to_csv(os.path.join(subdirs["csv"], 'test_predictions.csv'), index=False)
-    print("Individual dataset predictions also saved separately")
+    print('\n---------Generating Uncertainty Analysis Plots---------------')
+    plot_predictions_with_uncertainty(val_targets, val_preds, val_uncertainties, val_cif_ids, 'Validation')
+    plot_predictions_with_uncertainty(test_targets, test_preds, test_uncertainties, test_cif_ids, 'Test')
 
-    # 绘制验证集散点图
-    # 绘制验证集散点图（修改文件名+标签）
-    plt.figure(figsize=(8, 6))
-    plt.scatter(val_targets, val_preds, alpha=0.5, color='blue', label='Validation Predictions')
-    plt.plot([min(val_targets), max(val_targets)],
-             [min(val_targets), max(val_targets)], 'k--', lw=2, label='Ideal Prediction')
-    plt.xlabel('Calculated Band Gap (eV)', fontsize=18)  # 改为带隙+单位电子伏特
-    plt.ylabel('Predicted Band Gap (eV)', fontsize=18)  # 改为带隙+单位电子伏特
-    plt.legend()
-    plt.grid(True)
-    plt.savefig(os.path.join(subdirs["figure"], 'validation_bandgap_scatter.png'), dpi=300)  # 文件名含带隙
-    plt.close()
-    print("Validation set band gap scatter plot saved")
+    summary_data = {
+        'Dataset': ['Train', 'Validation', 'Test'],
+        'MAE (eV)': [
+            np.mean(np.abs(np.array(train_targets) - np.array(train_preds))),
+            np.mean(np.abs(np.array(val_targets) - np.array(val_preds))),
+            np.mean(np.abs(np.array(test_targets) - np.array(test_preds)))
+        ],
+        'Mean Uncertainty (eV)': [
+            np.mean(train_uncertainties),
+            np.mean(val_uncertainties),
+            np.mean(test_uncertainties)
+        ],
+        'Median Uncertainty (eV)': [
+            np.median(train_uncertainties),
+            np.median(val_uncertainties),
+            np.median(test_uncertainties)
+        ],
+        '90th Percentile Uncertainty (eV)': [
+            np.percentile(train_uncertainties, 90),
+            np.percentile(val_uncertainties, 90),
+            np.percentile(test_uncertainties, 90)
+        ]
+    }
 
-    # 保存验证集散点图原始数据（文件名同步修改）
-    val_scatter_data = pd.DataFrame({
-        'true_value': val_targets,
-        'predicted_value': val_preds,
-        'material_id': val_cif_ids
-    })
-    val_scatter_data.to_csv(os.path.join(subdirs["csv"], 'validation_bandgap_scatter_data.csv'), index=False)
-    print("Validation band gap scatter plot data saved")
-
-    # 绘制测试集散点图（修改文件名+标签）
-    plt.figure(figsize=(8, 6))
-    plt.scatter(test_targets, test_preds, alpha=0.5)
-    plt.plot([min(test_targets), max(test_targets)], [min(test_targets), max(test_targets)], 'k--', lw=2)
-    plt.xlabel('Calculated Band Gap (eV)', fontsize=18)  # 改为带隙+单位电子伏特
-    plt.ylabel('Predicted Band Gap (eV)', fontsize=18)  # 改为带隙+单位电子伏特
-    plt.title('Test Set Band Gap: Predictions vs True Values', fontsize=16)  # 标题含带隙
-    plt.grid(True)
-    plt.savefig(os.path.join(subdirs["figure"], 'test_bandgap_scatter.png'), dpi=300)  # 文件名含带隙
-    plt.close()
-    print("Test set band gap scatter plot saved")
-
-    # 保存测试集散点图原始数据（文件名同步修改）
-    test_scatter_data = pd.DataFrame({
-        'true_value': test_targets,
-        'predicted_value': test_preds,
-        'material_id': test_cif_ids
-    })
-    test_scatter_data.to_csv(os.path.join(subdirs["csv"], 'test_bandgap_scatter_data.csv'), index=False)
-    print("Test band gap scatter plot data saved")
+    summary_df = pd.DataFrame(summary_data)
+    summary_df.to_csv(os.path.join(subdirs["csv"], 'uncertainty_summary.csv'), index=False)
+    print("\n" + "=" * 60)
+    print("UNCERTAINTY ANALYSIS SUMMARY")
+    print("=" * 60)
+    print(summary_df.to_string(index=False))
+    print("=" * 60)
 
 
 def train(train_loader, model, criterion, optimizer, epoch, normalizer):
@@ -554,20 +763,16 @@ def train(train_loader, model, criterion, optimizer, epoch, normalizer):
         fscores = AverageMeter()
         auc_scores = AverageMeter()
 
-    # switch to train mode
     model.train()
 
-    # 创建进度条
     pbar = tqdm(total=len(train_loader), desc=f'Epoch {epoch}',
                 unit='batch', ncols=100, position=0, leave=True)
 
     end = time.time()
     for i, (input, target, _) in enumerate(train_loader):
-        # 拆分结构特征和额外特征
         struct_input = input[:4]
         extra_fea = input[4]
 
-        # measure data loading time
         data_time.update(time.time() - end)
 
         if args.cuda:
@@ -575,17 +780,14 @@ def train(train_loader, model, criterion, optimizer, epoch, normalizer):
                          Variable(struct_input[1].cuda(non_blocking=True)),
                          struct_input[2].cuda(non_blocking=True),
                          [crys_idx.cuda(non_blocking=True) for crys_idx in struct_input[3]],
-                         Variable(extra_fea.cuda(non_blocking=True))  # 添加额外特征
-                         )
+                         Variable(extra_fea.cuda(non_blocking=True)))
         else:
             input_var = (Variable(struct_input[0]),
                          Variable(struct_input[1]),
                          struct_input[2],
                          struct_input[3],
-                         Variable(extra_fea)  # 添加额外特征
-                         )
+                         Variable(extra_fea))
 
-        # normalize target
         if args.task == 'regression':
             target_normed = normalizer.norm(target)
         else:
@@ -595,11 +797,29 @@ def train(train_loader, model, criterion, optimizer, epoch, normalizer):
         else:
             target_var = Variable(target_normed)
 
-        # compute output
-        output = model(*input_var)
-        loss = criterion(output, target_var)
+        if args.use_weighted_loss:
+            if args.use_adaptive_weights:
+                output, complexities, adaptive_weights = model(*input_var, return_complexity=True)
+                loss = criterion(output, target_var, complexities=complexities, adaptive_weights=adaptive_weights)
+            else:
+                output, complexities = model(*input_var, return_complexity=True)
+                loss = criterion(output, target_var, complexities=complexities)
+        else:
+            output = model(*input_var, return_complexity=False)
+            loss = criterion(output, target_var)
 
-        # measure accuracy and record loss
+        if args.use_weighted_loss and i == 0 and epoch % 10 == 0:
+            if args.use_adaptive_weights:
+                fusion_weights = model.complexity_module.fusion_weights.detach().cpu()
+                weight_base = model.complexity_module.weight_base.item()
+                weight_range = model.complexity_module.weight_range.item()
+                print(f"[Epoch {epoch}] 自适应参数 - 融合权重: {fusion_weights.tolist()}, "
+                      f"基础权重: {weight_base:.3f}, 范围: {weight_range:.3f}, "
+                      f"平均权重: {criterion.last_weights_mean:.3f}")
+            else:
+                print(f"[Epoch {epoch}] 固定权重 - 平均复杂度: {criterion.last_complexity_mean:.3f}, "
+                      f"平均权重: {criterion.last_weights_mean:.3f}")
+
         if args.task == 'regression':
             mae_error = mae(normalizer.denorm(output.data.cpu()), target)
             losses.update(loss.data.cpu(), target.size(0))
@@ -614,16 +834,13 @@ def train(train_loader, model, criterion, optimizer, epoch, normalizer):
             fscores.update(fscore, target.size(0))
             auc_scores.update(auc_score, target.size(0))
 
-        # compute gradient and do SGD step
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
 
-        # 更新进度条描述
         if args.task == 'regression':
             pbar.set_postfix({
                 'Loss': f'{losses.avg:.4f}',
@@ -638,7 +855,6 @@ def train(train_loader, model, criterion, optimizer, epoch, normalizer):
                 'LR': f'{optimizer.param_groups[0]["lr"]:.6f}'
             })
 
-        # 只在print_freq间隔时打印详细信息
         if i % args.print_freq == 0:
             if args.task == 'regression':
                 tqdm.write(f'Epoch {epoch} - Batch {i}/{len(train_loader)} - '
@@ -649,9 +865,9 @@ def train(train_loader, model, criterion, optimizer, epoch, normalizer):
                            f'Loss: {losses.avg:.4f} - Acc: {accuracies.avg:.3f} - '
                            f'F1: {fscores.avg:.3f} - LR: {optimizer.param_groups[0]["lr"]:.6f}')
 
-        pbar.update(1)  # 更新进度条
+        pbar.update(1)
 
-    pbar.close()  # 关闭进度条
+    pbar.close()
 
     if args.task == 'regression':
         return losses.avg, mae_errors.avg
@@ -671,21 +887,17 @@ def validate(val_loader, model, criterion, normalizer, test=False):
         fscores = AverageMeter()
         auc_scores = AverageMeter()
 
-    # 初始化存储验证集/测试集的预测值和真实值
     val_targets = []
     val_preds = []
     val_cif_ids = []
 
-    # switch to evaluate mode
     model.eval()
 
-    # 创建验证进度条
     desc = 'Testing' if test else 'Validating'
     pbar = tqdm(total=len(val_loader), desc=desc, unit='batch', ncols=100, position=0, leave=True)
 
     end = time.time()
     for i, (input, target, batch_cif_ids) in enumerate(val_loader):
-        # 拆分结构特征和额外特征
         struct_input = input[:4]
         extra_fea = input[4]
 
@@ -695,16 +907,14 @@ def validate(val_loader, model, criterion, normalizer, test=False):
                              Variable(struct_input[1].cuda(non_blocking=True)),
                              struct_input[2].cuda(non_blocking=True),
                              [crys_idx.cuda(non_blocking=True) for crys_idx in struct_input[3]],
-                             Variable(extra_fea.cuda(non_blocking=True))  # 添加额外特征
-                             )
+                             Variable(extra_fea.cuda(non_blocking=True)))
         else:
             with torch.no_grad():
                 input_var = (Variable(struct_input[0]),
                              Variable(struct_input[1]),
                              struct_input[2],
                              struct_input[3],
-                             Variable(extra_fea)  # 添加额外特征
-                             )
+                             Variable(extra_fea))
 
         if args.task == 'regression':
             target_normed = normalizer.norm(target)
@@ -717,23 +927,27 @@ def validate(val_loader, model, criterion, normalizer, test=False):
             with torch.no_grad():
                 target_var = Variable(target_normed)
 
-        # compute output
-        output = model(*input_var)
-        loss = criterion(output, target_var)
+        if args.use_weighted_loss:
+            if args.use_adaptive_weights:
+                output, complexities, adaptive_weights = model(*input_var, return_complexity=True)
+                loss = criterion(output, target_var, complexities=complexities, adaptive_weights=adaptive_weights)
+            else:
+                output, complexities = model(*input_var, return_complexity=True)
+                loss = criterion(output, target_var, complexities=complexities)
+        else:
+            output = model(*input_var, return_complexity=False)
+            loss = criterion(output, target_var)
 
-        # measure accuracy and record loss
         if args.task == 'regression':
             mae_error = mae(normalizer.denorm(output.data.cpu()), target)
             losses.update(loss.data.cpu().item(), target.size(0))
             mae_errors.update(mae_error, target.size(0))
-            # 记录验证集的预测值和真实值
             val_pred = normalizer.denorm(output.data.cpu())
             val_target = target
             val_preds += val_pred.view(-1).tolist()
             val_targets += val_target.view(-1).tolist()
             val_cif_ids += batch_cif_ids
 
-            # 更新进度条
             pbar.set_postfix({
                 'Loss': f'{losses.avg:.4f}',
                 'MAE': f'{mae_errors.avg:.3f}'
@@ -753,7 +967,6 @@ def validate(val_loader, model, criterion, normalizer, test=False):
                 'Acc': f'{accuracies.avg:.3f}'
             })
 
-        # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
 
@@ -770,10 +983,9 @@ def validate(val_loader, model, criterion, normalizer, test=False):
 
 
 class Normalizer(object):
-    """Normalize a Tensor and restore it later. """
+    """Normalize a Tensor and restore it later."""
 
     def __init__(self, tensor):
-        """tensor is taken as a sample to calculate the mean and std"""
         self.mean = torch.mean(tensor)
         self.std = torch.std(tensor)
 
@@ -793,9 +1005,7 @@ class Normalizer(object):
 
 
 def mae(prediction, target):
-    """
-    Computes the mean absolute error between prediction and target
-    """
+    """Computes the mean absolute error between prediction and target"""
     return torch.mean(torch.abs(target - prediction))
 
 
@@ -852,7 +1062,6 @@ def adjust_learning_rate(optimizer, epoch, k):
 
 
 def plot_loss_curve(train_losses, val_losses):
-    # 保存损失曲线原始数据到 CSV
     loss_data = pd.DataFrame({
         'epoch': range(1, len(train_losses) + 1),
         'train_loss': train_losses,
@@ -861,7 +1070,6 @@ def plot_loss_curve(train_losses, val_losses):
     loss_data.to_csv(os.path.join(subdirs["train_data"], 'loss_curve_data.csv'), index=False)
     print("Loss curve data saved")
 
-    # 绘制损失曲线
     plt.figure(figsize=(10, 6))
     plt.plot(train_losses, label='Training Loss', color='red', linestyle='-')
     plt.plot(val_losses, label='Validation Loss', color='blue', linestyle='--')
@@ -876,17 +1084,16 @@ def plot_loss_curve(train_losses, val_losses):
 
 
 if __name__ == '__main__':
-    # 设置默认参数
     class Args:
         def __init__(self):
-            self.data_options = ['D:\\modle-new\\数据清洗\\ABO3-DATA1']  # 修改为你的数据路径
+            self.data_options = ['']
             self.dropout = 0.2
             self.task = 'regression'
             self.disable_cuda = False
             self.workers = 0
             self.epochs = 100
             self.start_epoch = 0
-            self.batch_size = 64
+            self.batch_size = 128
             self.lr = 0.001
             self.lr_milestones = [25, 50, 75]
             self.momentum = 0.9
@@ -905,10 +1112,26 @@ if __name__ == '__main__':
             self.n_conv = 3
             self.n_h = 3
             self.cuda = not self.disable_cuda and torch.cuda.is_available()
-            self.feature_file = 'D:\\modle-new\\数据清洗\\ABO3-DATA1\\features.csv'  # 添加默认特征文件路径
-            self.manual_notes = ''  # 新增：手动备注参数
+            self.feature_file = ''
+            self.manual_notes = ''
+            self.use_weighted_loss = True
+            self.use_adaptive_weights = True
+            self.weight_min = 0.2
+            self.weight_max = 1.2
+            self.mc_dropout_samples = 50
+            self.confidence_interval = 95
+            self.output_dir = ''
 
 
-    # 创建参数对象并运行主函数
     args = Args()
+
+    try:
+        import scipy.stats
+    except ImportError:
+        print("Warning: scipy not installed. Installing scipy...")
+        import subprocess
+
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "scipy"])
+        import scipy.stats
+
     main()
