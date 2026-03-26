@@ -221,17 +221,13 @@ def plot_mae_curve(train_maes, val_maes):
 
 def main():
     def set_seed(seed=2):
-        """固定所有随机种子，确保结果可重复"""
         import random
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-        # 以下设置让 cudnn 使用确定性算法，可能会降低性能，但保证可重复
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
-
-    # 在 main() 的第一行调用
     set_seed(2)
     global best_mae_error, subdirs, main_output_dir
     current_time = datetime.datetime.now().strftime("%Y%m%d%H%M")
